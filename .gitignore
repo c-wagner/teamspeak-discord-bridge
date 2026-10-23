@@ -13,3 +13,6 @@ ts-side/target/
 Thumbs.db
 .vscode/
 .idea/
+
+# Generated per-server runtime configs (contain passwords)
+data/.runtime-*.json

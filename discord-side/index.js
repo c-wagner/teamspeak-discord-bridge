@@ -1,8 +1,11 @@
-// TeamSpeak <-> Discord voice bridge, Discord side.
+// TeamSpeak <-> Discord bridge, Discord side.
 //
 // Every TS user in a bridged channel is shown by its own Discord bot (renamed to
-// the TS nickname) that plays that user's voice. Every Discord user who joins a
-// bridged voice channel gets an own TS client that speaks for them.
+// the TS nickname) that plays that user's voice, posts their channel messages and
+// carries their private messages as DMs. Every Discord user who joins a bridged
+// voice channel gets an own TS client that speaks and writes for them.
+//
+// One Rust process ("ts-side") runs per configured TeamSpeak server.
 'use strict';
 
 const fs = require('node:fs');
@@ -24,25 +27,63 @@ const { bbcodeToDiscord, clip, strings } = require('./text');
 
 // ---------- Config ----------
 const configPath = path.resolve(process.argv[2] || path.join(__dirname, '..', 'data', 'config.json'));
+const dataDir = path.dirname(configPath);
 const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 const dc = cfg.discord;
-const channels = cfg.channels;
-const suffix = dc.dcNameSuffix ?? ' (DC)';
-const placeholderName = dc.placeholderName ?? 'TeamSpeak';
-const relayChat = dc.relayChat !== false; // channel chat + private messages
-const t = strings(dc.language);
+const suffix = dc?.dcNameSuffix ?? ' (DC)';
+const placeholderName = dc?.placeholderName ?? 'TeamSpeak';
+const relayChat = dc?.relayChat !== false; // channel chat + private messages
+const t = strings(dc?.language);
 const tsBinary =
   process.env.TS_BINARY ||
   (cfg.tsBinary
-    ? path.resolve(path.dirname(configPath), cfg.tsBinary)
+    ? path.resolve(dataDir, cfg.tsBinary)
     : path.resolve(__dirname, '..', 'ts-side', 'target', 'release', 'ts-bridge'));
 
 if (!dc?.guildId || !Array.isArray(dc.tokens) || dc.tokens.length === 0) {
   throw new Error('config.json: discord.guildId and discord.tokens are required');
 }
-if (!Array.isArray(channels) || channels.length === 0 || channels.length > 10) {
-  throw new Error('config.json: channels needs 1 to 10 entries');
+
+/**
+ * Servers: either `servers: [{ name, address, ... }]` or the single-server form `ts: { address, ... }`.
+ * Channels refer to a server by `server: "<name>"`, the first server is the default.
+ */
+function loadServers() {
+  let list;
+  if (Array.isArray(cfg.servers) && cfg.servers.length) {
+    list = cfg.servers.map((s, i) => ({ ...s, name: s.name || `server${i + 1}` }));
+    for (const s of list) if (!s.identityDir) s.identityDir = path.join('identities', s.name);
+  } else if (cfg.ts) {
+    list = [{ ...cfg.ts, name: 'default', identityDir: cfg.ts.identityDir || 'identities' }];
+  } else {
+    throw new Error('config.json: "servers" (or "ts") is required');
+  }
+  const names = new Set();
+  for (const s of list) {
+    if (!s.address) throw new Error(`config.json: server "${s.name}" has no address`);
+    if (names.has(s.name)) throw new Error(`config.json: server name "${s.name}" is used twice`);
+    names.add(s.name);
+  }
+  return list;
 }
+
+const serverList = loadServers();
+if (!Array.isArray(cfg.channels) || cfg.channels.length === 0 || cfg.channels.length > 50) {
+  throw new Error('config.json: channels needs 1 to 50 entries');
+}
+/** Global channel list: { ts, tsPassword, discord, server, local } */
+const channels = cfg.channels.map((c) => {
+  const server = c.server || serverList[0].name;
+  if (!serverList.some((s) => s.name === server)) throw new Error(`config.json: channel "${c.ts}" uses unknown server "${server}"`);
+  return { ...c, server };
+});
+/** name -> { cfg, proc, channels: [global index by local index] } */
+const servers = new Map(serverList.map((s) => [s.name, { cfg: s, proc: null, channels: [] }]));
+channels.forEach((c, i) => {
+  const srv = servers.get(c.server);
+  c.local = srv.channels.length;
+  srv.channels.push(i);
+});
 
 function log(tag, msg) {
   console.log(`${new Date().toISOString()} [${tag}] ${msg}`);
@@ -56,12 +97,23 @@ const joinedHumans = new Map();
 /** Discord user ids whose TS connection failed recently -> retry timestamp */
 const retryAfter = new Map();
 const botIds = new Set();
-/** Discord user id -> last TS client that wrote privately: { id, name } */
+/** Discord user id -> last TS client that wrote privately: { server, id, name, chan } */
 const lastPrivate = new Map();
-/** Last "active" state sent to the TS process per channel */
-let lastActive = channels.map(() => null);
+/** "server:tsClientId" -> Discord user id, for replies to messages the listener relayed */
+const listenerReplies = new Map();
+/** Last "active" state sent per channel */
+const lastActive = channels.map(() => null);
 let bots = [];
 let manager = null;
+
+function sendTs(serverName, obj) {
+  const srv = servers.get(serverName);
+  if (srv?.proc) srv.proc.send(obj);
+}
+
+function serverRunning(serverName) {
+  return !!servers.get(serverName)?.proc?.proc;
+}
 
 // ---------- Audio playback per bot ----------
 // Plays incoming TS Opus packets. A new resource is started per talk burst so
@@ -94,26 +146,28 @@ class SpeakerPipe {
 
 // ---------- Discord bots ----------
 const BASE_INTENTS = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates];
-const CHAT_INTENTS = [GatewayIntentBits.GuildMessages, GatewayIntentBits.DirectMessages];
 
 function makeClient(idx, withMessageContent) {
-  // Only the first bot ("manager") handles text: voice channel chat and DMs.
-  if (idx !== 0 || !relayChat) return new Client({ intents: BASE_INTENTS });
-  const intents = [...BASE_INTENTS, ...CHAT_INTENTS];
-  if (withMessageContent) intents.push(GatewayIntentBits.MessageContent);
+  if (!relayChat) return new Client({ intents: BASE_INTENTS });
+  // Every bot receives DMs (private messages to "its" TS user). Only the first one
+  // ("manager") reads the voice channel chat, which needs the Message Content Intent.
+  const intents = [...BASE_INTENTS, GatewayIntentBits.DirectMessages];
+  if (idx === 0) {
+    intents.push(GatewayIntentBits.GuildMessages);
+    if (withMessageContent) intents.push(GatewayIntentBits.MessageContent);
+  }
   return new Client({ intents, partials: [Partials.Channel] });
 }
 
 function makeBot(token, idx) {
-  const client = makeClient(idx, true);
   const player = createAudioPlayer({
     behaviors: { noSubscriber: NoSubscriberBehavior.Play, maxMissedFrames: 15 },
   });
   player.on('error', (e) => log(`Bot${idx}`, `Player error: ${e.message}`));
-  const bot = {
+  return {
     idx,
     token,
-    client,
+    client: makeClient(idx, true),
     player,
     pipe: new SpeakerPipe(player),
     guild: null,
@@ -121,29 +175,30 @@ function makeBot(token, idx) {
     channelIdx: null, // which bridged channel the bot sits in
     role: null, // null | 'speaker' | 'placeholder'
     tsClientId: null,
+    tsName: null,
     nickname: undefined,
   };
-  return bot;
 }
 
 async function loginBot(bot) {
-  try {
+  const login = async () => {
     const ready = new Promise((resolve) => bot.client.once(Events.ClientReady, resolve));
     await bot.client.login(bot.token);
     await ready;
+  };
+  try {
+    await login();
   } catch (e) {
     if (bot.idx !== 0 || !relayChat || !/disallowed intents/i.test(e.message)) throw e;
-    // Message Content Intent is not enabled for the first bot: run without channel chat.
     log('DC', 'Message Content Intent is not enabled for the first bot, Discord -> TS channel chat is off. Enable it in the Developer Portal (Bot > Privileged Gateway Intents).');
     bot.client.destroy();
     bot.client = makeClient(0, false);
-    const ready = new Promise((resolve) => bot.client.once(Events.ClientReady, resolve));
-    await bot.client.login(bot.token);
-    await ready;
+    await login();
   }
   botIds.add(bot.client.user.id);
   bot.guild = await bot.client.guilds.fetch(dc.guildId).catch(() => null);
   if (!bot.guild) throw new Error(`Bot ${bot.client.user.tag} is not a member of Discord server ${dc.guildId}, invite it first`);
+  if (relayChat) bot.client.on(Events.MessageCreate, (msg) => onDiscordMessage(bot, msg));
   log(`Bot${bot.idx}`, `Logged in as ${bot.client.user.tag}`);
 }
 
@@ -162,6 +217,12 @@ async function setNick(bot, name) {
     bot.nickname = undefined;
     log(`Bot${bot.idx}`, `Could not set nickname (missing "Change Nickname" permission?): ${e.message}`);
   }
+}
+
+function sendAudioFor(userId, opus) {
+  const idx = joinedHumans.get(userId);
+  if (idx === undefined) return;
+  servers.get(channels[idx].server)?.proc?.sendAudio(userId, opus);
 }
 
 function connectBot(bot, chanIdx) {
@@ -202,7 +263,7 @@ function connectBot(bot, chanIdx) {
     const receiver = connection.receiver;
     if (receiver.subscriptions.has(userId)) return;
     const sub = receiver.subscribe(userId, { end: { behavior: EndBehaviorType.AfterSilence, duration: 500 } });
-    sub.on('data', (opus) => ts.sendAudio(userId, opus));
+    sub.on('data', (opus) => sendAudioFor(userId, opus));
     sub.on('error', () => {});
   });
 }
@@ -220,24 +281,28 @@ function disconnectBot(bot) {
 
 /** The bot that records Discord users in a channel: the first ready bot in it. */
 function receiverOf(chanIdx) {
+  return (
+    bots.find((b) => b.role && b.channelIdx === chanIdx && b.connection?.state.status === VoiceConnectionStatus.Ready) ||
+    bots.find((b) => b.role && b.channelIdx === chanIdx && b.connection)
+  );
+}
+
+/** The bot that currently shows TS client `id` of `server`, if any. */
+function speakerBotFor(server, id) {
   return bots.find(
-    (b) =>
-      b.role &&
-      b.channelIdx === chanIdx &&
-      b.connection &&
-      b.connection.state.status === VoiceConnectionStatus.Ready,
-  ) || bots.find((b) => b.role && b.channelIdx === chanIdx && b.connection);
+    (b) => b.role === 'speaker' && b.channelIdx !== null && channels[b.channelIdx].server === server && b.tsClientId === id,
+  );
 }
 
 // ---------- Discord humans -> TS clients ----------
 function humansIn(chanIdx) {
-  const ch = manager.guild.channels.cache.get(channels[chanIdx].discord);
+  const ch = manager?.guild.channels.cache.get(channels[chanIdx].discord);
   if (!ch || !ch.members) return [];
   return [...ch.members.values()].filter((m) => !m.user.bot);
 }
 
 function syncHumans() {
-  if (!ts.proc) return; // TS process is restarting, 'started' triggers a new sync
+  if (!manager) return;
   const wanted = new Map();
   channels.forEach((_, i) => {
     for (const m of humansIn(i)) wanted.set(m.id, { idx: i, member: m });
@@ -245,26 +310,29 @@ function syncHumans() {
   for (const [uid, idx] of joinedHumans) {
     const w = wanted.get(uid);
     if (!w || w.idx !== idx) {
-      ts.send({ type: 'leave', key: uid });
+      sendTs(channels[idx].server, { type: 'leave', key: uid });
       joinedHumans.delete(uid);
       log('DC', `${uid} left bridge channel ${idx}`);
     }
   }
   // Listener in TS: in the bridged channel only while Discord users are there, else in the AFK channel.
-  channels.forEach((_, i) => {
+  channels.forEach((c, i) => {
+    if (!serverRunning(c.server)) return;
     const active = [...wanted.values()].some((w) => w.idx === i);
     if (lastActive[i] !== active) {
       lastActive[i] = active;
-      ts.send({ type: 'active', channel: i, active });
+      sendTs(c.server, { type: 'active', channel: c.local, active });
     }
   });
   const now = Date.now();
   for (const [uid, { idx, member }] of wanted) {
     if (joinedHumans.has(uid)) continue;
     if ((retryAfter.get(uid) || 0) > now) continue;
+    const c = channels[idx];
+    if (!serverRunning(c.server)) continue; // the 'started' event triggers a new sync
     const name = `${member.displayName}${suffix}`.slice(0, 30);
     joinedHumans.set(uid, idx);
-    ts.send({ type: 'join', key: uid, name, channel: idx });
+    sendTs(c.server, { type: 'join', key: uid, name, channel: c.local });
     log('DC', `${member.displayName} joined bridge channel ${idx}, connecting "${name}" to TS`);
   }
 }
@@ -289,17 +357,17 @@ async function runReconcile() {
   }
 }
 
-function pickFreeBot(chanIdx) {
-  const free = bots.filter((b) => !b.role);
-  return (
-    free.find((b) => b.channelIdx === chanIdx && b.connection) ||
-    free.find((b) => !b.connection) ||
-    free[0]
-  );
+function pickFreeBot(chanIdx, forSpeaker) {
+  // With text relay on, the first bot never shows a TS user: its DMs are the fallback for
+  // private messages, so a DM to it must not be mistaken for a message to "its" TS user.
+  const reserveManager = forSpeaker && relayChat && bots.length > 1;
+  const free = bots.filter((b) => !b.role && !(reserveManager && b === manager));
+  return free.find((b) => b.channelIdx === chanIdx && b.connection) || free.find((b) => !b.connection) || free[0];
 }
 
 let poolWarned = false;
 async function reconcile() {
+  if (!manager) return;
   // 1. Release bots whose TS user is gone, placeholders are re-decided below.
   for (const b of bots) {
     if (b.role === 'placeholder') b.role = null;
@@ -308,6 +376,7 @@ async function reconcile() {
       if (!st || !st.clients.some((c) => c.id === b.tsClientId)) {
         b.role = null;
         b.tsClientId = null;
+        b.tsName = null;
         b.pipe.end();
       }
     }
@@ -319,7 +388,7 @@ async function reconcile() {
     for (const c of tsState[i].clients) {
       let bot = bots.find((b) => b.role === 'speaker' && b.channelIdx === i && b.tsClientId === c.id);
       if (!bot) {
-        bot = pickFreeBot(i);
+        bot = pickFreeBot(i, true);
         if (!bot) {
           missing++;
           continue;
@@ -328,6 +397,7 @@ async function reconcile() {
         bot.tsClientId = c.id;
         connectBot(bot, i);
       }
+      bot.tsName = c.name;
       await setNick(bot, c.name);
     }
   }
@@ -340,11 +410,11 @@ async function reconcile() {
   for (let i = 0; i < channels.length; i++) {
     if (humansIn(i).length === 0) continue;
     if (bots.some((b) => b.role && b.channelIdx === i)) continue;
-    const bot = pickFreeBot(i);
+    const bot = pickFreeBot(i, false);
     if (!bot) continue;
     bot.role = 'placeholder';
     connectBot(bot, i);
-    await setNick(bot, tsState[i].connected ? `${placeholderName}: ${t.placeholderEmpty}` : `${placeholderName}: ${t.placeholderOffline}`);
+    await setNick(bot, `${placeholderName}: ${tsState[i].connected ? t.placeholderEmpty : t.placeholderOffline}`);
   }
 
   // 4. Unused bots leave voice.
@@ -358,82 +428,120 @@ async function reconcile() {
   }
 }
 
-// ---------- TS process ----------
-const ts = new TsProcess(tsBinary, configPath, log);
+// ---------- TS processes ----------
+function startServer(name) {
+  const srv = servers.get(name);
+  const runtimePath = path.join(dataDir, `.runtime-${name.replace(/[^A-Za-z0-9_-]/g, '_')}.json`);
+  const runtime = {
+    ts: srv.cfg,
+    channels: srv.channels.map((g) => ({ ts: channels[g].ts, tsPassword: channels[g].tsPassword || '' })),
+  };
+  fs.writeFileSync(runtimePath, JSON.stringify(runtime, null, 2));
+  const tag = servers.size > 1 ? `TS:${name}` : 'TS';
+  const proc = new TsProcess(tsBinary, runtimePath, (_, msg) => log(tag, msg));
+  srv.proc = proc;
+  const global = (local) => srv.channels[local];
 
-ts.on('event', (ev) => {
-  if (ev.type === 'channel') {
-    const before = JSON.stringify(tsState[ev.index]);
-    tsState[ev.index] = { connected: ev.connected, name: ev.name, clients: ev.clients || [] };
-    if (before !== JSON.stringify(tsState[ev.index])) {
-      const names = tsState[ev.index].clients.map((c) => c.name).join(', ') || 'nobody';
-      log('TS', `Channel ${ev.index} (${ev.name || channels[ev.index].ts}): ${names}`);
-      scheduleReconcile();
+  proc.on('event', (ev) => {
+    if (ev.type === 'channel') {
+      const g = global(ev.index);
+      if (g === undefined) return;
+      const before = JSON.stringify(tsState[g]);
+      tsState[g] = { connected: ev.connected, name: ev.name, clients: ev.clients || [] };
+      if (before !== JSON.stringify(tsState[g])) {
+        const names = tsState[g].clients.map((c) => c.name).join(', ') || 'nobody';
+        log(tag, `Channel ${g} (${ev.name || channels[g].ts}): ${names}`);
+        scheduleReconcile();
+      }
+    } else if (ev.type === 'chat') {
+      onTsChat(name, global(ev.index), ev);
+    } else if (ev.type === 'private') {
+      onTsPrivate(name, joinedHumans.get(ev.key), ev);
+    } else if (ev.type === 'listenerPrivate') {
+      const uid = listenerReplies.get(`${name}:${ev.from_id}`);
+      if (uid) onTsPrivate(name, global(ev.index), { ...ev, key: uid });
+      else log(tag, `Private message from ${ev.from_name} to the listener, nobody to forward it to`);
+    } else if (ev.type === 'user' && ev.status === 'notice') {
+      sendDm(manager, ev.key, t[ev.detail] || ev.detail);
+    } else if (ev.type === 'user') {
+      log(tag, `Discord user ${ev.key}: ${ev.status}${ev.detail ? ` (${ev.detail})` : ''}`);
+      if (ev.status === 'error' && joinedHumans.has(ev.key)) {
+        joinedHumans.delete(ev.key);
+        retryAfter.set(ev.key, Date.now() + 15000);
+        setTimeout(syncHumans, 15500);
+      }
     }
-  } else if (ev.type === 'chat') {
-    onTsChat(ev);
-  } else if (ev.type === 'private') {
-    onTsPrivate(ev);
-  } else if (ev.type === 'user' && ev.status === 'notice') {
-    sendDm(ev.key, t[ev.detail] || ev.detail);
-  } else if (ev.type === 'user') {
-    log('TS', `Discord user ${ev.key}: ${ev.status}${ev.detail ? ` (${ev.detail})` : ''}`);
-    if (ev.status === 'error' && joinedHumans.has(ev.key)) {
-      joinedHumans.delete(ev.key);
-      retryAfter.set(ev.key, Date.now() + 15000);
-      setTimeout(syncHumans, 15500);
-    }
-  }
-});
+  });
 
-ts.on('audio', (chanIdx, clientId, opus) => {
-  const bot = bots.find((b) => b.role === 'speaker' && b.channelIdx === chanIdx && b.tsClientId === clientId);
-  if (!bot || !bot.connection) return;
-  if (humansIn(chanIdx).length === 0) return; // nobody listening on Discord
-  bot.pipe.push(opus);
-});
+  proc.on('audio', (local, clientId, opus) => {
+    const g = global(local);
+    const bot = bots.find((b) => b.role === 'speaker' && b.channelIdx === g && b.tsClientId === clientId);
+    if (!bot || !bot.connection) return;
+    if (humansIn(g).length === 0) return; // nobody listening on Discord
+    bot.pipe.push(opus);
+  });
 
-ts.on('restart', () => {
-  // The TS process lost all clients, re-announce Discord users once it is back.
-  joinedHumans.clear();
-  tsState.forEach((_, i) => (tsState[i] = { connected: false, name: '', clients: [] }));
-  scheduleReconcile();
-});
-ts.on('started', () => {
-  lastActive = channels.map(() => null);
-  setTimeout(syncHumans, 1000);
-});
+  proc.on('restart', () => {
+    // The TS process lost all its clients, re-announce Discord users once it is back.
+    for (const [uid, idx] of joinedHumans) if (channels[idx].server === name) joinedHumans.delete(uid);
+    for (const g of srv.channels) tsState[g] = { connected: false, name: '', clients: [] };
+    scheduleReconcile();
+  });
+  proc.on('started', () => {
+    for (const g of srv.channels) lastActive[g] = null;
+    setTimeout(syncHumans, 1000);
+  });
+  proc.start();
+}
 
 // ---------- Text: channel chat and private messages ----------
-async function onTsChat(ev) {
-  if (!relayChat || !manager) return;
+async function postToChannel(bot, chanIdx, content) {
+  const ch = await bot.client.channels.fetch(channels[chanIdx].discord);
+  await ch.send({ content: clip(content), allowedMentions: { parse: [] } });
+}
+
+async function onTsChat(server, chanIdx, ev) {
+  if (!relayChat || !manager || chanIdx === undefined) return;
   const text = bbcodeToDiscord(ev.text);
   if (!text) return;
+  // Posted by the bot that shows the writer, so it reads like a normal chat.
+  const bot = speakerBotFor(server, ev.from_id);
+  if (bot && bot !== manager) {
+    try {
+      return await postToChannel(bot, chanIdx, text);
+    } catch (e) {
+      log(`Bot${bot.idx}`, `Could not post to the voice channel chat (missing "Send Messages"?), using the first bot: ${e.message}`);
+    }
+  }
   try {
-    const ch = await manager.client.channels.fetch(channels[ev.index].discord);
-    await ch.send({ content: clip(t.channelChat(ev.from, text)), allowedMentions: { parse: [] } });
+    await postToChannel(manager, chanIdx, t.channelChat(ev.from, text));
   } catch (e) {
     log('DC', `Could not post TS chat to Discord: ${e.message}`);
   }
 }
 
-async function sendDm(userId, content) {
-  if (!manager) return;
+async function sendDm(bot, userId, content) {
+  if (!bot) return;
   try {
-    const user = await manager.client.users.fetch(userId);
+    const user = await bot.client.users.fetch(userId);
     await user.send({ content: clip(content), allowedMentions: { parse: [] } });
   } catch (e) {
-    log('DC', `Could not DM ${userId} (DMs from server members disabled?): ${e.message}`);
+    log(`Bot${bot.idx}`, `Could not DM ${userId} (DMs from server members disabled?): ${e.message}`);
   }
 }
 
-function onTsPrivate(ev) {
+/** TS -> Discord DM. Sent by the bot of the TS user if they have one, else by the first bot. */
+function onTsPrivate(server, chanIdx, ev) {
   if (!relayChat) return;
-  lastPrivate.set(ev.key, { id: ev.from_id, name: ev.from_name });
+  const own = speakerBotFor(server, ev.from_id);
+  const bot = own || manager;
+  lastPrivate.set(ev.key, { server, id: ev.from_id, name: ev.from_name, chan: chanIdx });
+  // In the first bot's DMs the reply target is "whoever wrote last", so say so.
+  const hint = own ? null : t.replyHint(ev.from_name);
   const text = bbcodeToDiscord(ev.text || '');
-  if (ev.kind === 'poke') sendDm(ev.key, t.poke(ev.from_name, text));
-  else if (ev.kind === 'whisper') sendDm(ev.key, t.whisper(ev.from_name));
-  else sendDm(ev.key, t.privateMessage(ev.from_name, text));
+  if (ev.kind === 'poke') sendDm(bot, ev.key, t.poke(ev.from_name, text, hint));
+  else if (ev.kind === 'whisper') sendDm(bot, ev.key, t.whisper(ev.from_name, hint));
+  else sendDm(bot, ev.key, t.privateMessage(ev.from_name, text, hint));
 }
 
 function messageText(msg) {
@@ -441,24 +549,46 @@ function messageText(msg) {
   return parts.filter(Boolean).join(' ');
 }
 
-function onDiscordMessage(msg) {
+/** Discord DM -> TS private message, from the user's own TS client or, without one, from the listener. */
+function sendPrivate(msg, target, text) {
+  const uid = msg.author.id;
+  const joined = joinedHumans.get(uid);
+  if (joined !== undefined && channels[joined].server === target.server) {
+    sendTs(target.server, { type: 'private', key: uid, to: target.id, text });
+  } else {
+    const srv = servers.get(target.server);
+    const chan = target.chan !== undefined && channels[target.chan]?.server === target.server ? target.chan : srv.channels[0];
+    const name = (msg.author.globalName || msg.author.username) + suffix;
+    sendTs(target.server, { type: 'listenerPrivate', channel: channels[chan].local, to: target.id, text: `[b]${name}:[/b] ${text}` });
+    listenerReplies.set(`${target.server}:${target.id}`, uid);
+  }
+  msg.react('✅').catch(() => {});
+}
+
+function onDiscordMessage(bot, msg) {
   if (msg.author.bot || botIds.has(msg.author.id)) return;
   const text = messageText(msg);
   if (!text) return;
 
-  // DM to the bot -> private message to whoever last wrote on TS
   if (msg.channel.type === ChannelType.DM) {
-    const target = lastPrivate.get(msg.author.id);
-    if (!target) return void msg.reply(t.noReplyTarget).catch(() => {});
-    if (!joinedHumans.has(msg.author.id)) return void msg.reply(t.not_connected).catch(() => {});
-    ts.send({ type: 'private', key: msg.author.id, to: target.id, text });
-    msg.react('✅').catch(() => {});
-    return;
+    let target;
+    if (bot.role === 'speaker') {
+      // DM to the bot "Max" goes to Max.
+      target = { server: channels[bot.channelIdx].server, id: bot.tsClientId, name: bot.tsName, chan: bot.channelIdx };
+    } else if (bot === manager) {
+      target = lastPrivate.get(msg.author.id);
+      if (!target) return void msg.reply(t.noReplyTarget).catch(() => {});
+    } else {
+      return void msg.reply(t.botIdle).catch(() => {});
+    }
+    return sendPrivate(msg, target, text);
   }
 
-  // Text chat of a bridged voice channel -> TS channel chat
+  // Text chat of a bridged voice channel -> TS channel chat (read by the first bot only)
+  if (bot !== manager) return;
   const idx = channels.findIndex((c) => c.discord === msg.channelId);
   if (idx < 0) return;
+  const c = channels[idx];
   const key = joinedHumans.get(msg.author.id) === idx ? msg.author.id : null;
   if (!key && !lastActive[idx]) {
     // Nobody from Discord in the channel: the TS listener waits in the AFK channel and cannot post.
@@ -466,27 +596,24 @@ function onDiscordMessage(msg) {
     return;
   }
   const name = msg.member?.displayName || msg.author.username;
-  ts.send({ type: 'chat', channel: idx, key, name, text });
+  sendTs(c.server, { type: 'chat', channel: c.local, key, name, text });
 }
 
 // ---------- Start ----------
 async function main() {
   // Placeholders like "TOKEN_BOT_2" are skipped, so the bridge runs with the bots filled in so far.
-  const tokens = dc.tokens.filter((t) => typeof t === 'string' && t.length > 50 && !/^(HIER_|TOKEN_)/.test(t));
+  const tokens = dc.tokens.filter((tok) => typeof tok === 'string' && tok.length > 50 && !/^(HIER_|TOKEN_)/.test(tok));
   if (tokens.length === 0) throw new Error('config.json: no valid bot token found');
   if (tokens.length < dc.tokens.length) log('DC', `Skipped ${dc.tokens.length - tokens.length} token placeholder(s)`);
-  bots = tokens.map((t, i) => makeBot(t, i));
+  bots = tokens.map((tok, i) => makeBot(tok, i));
   for (const b of bots) await loginBot(b);
   manager = bots[0];
-  manager.guild = await manager.client.guilds.fetch(dc.guildId);
 
   for (const c of channels) {
     const ch = await manager.guild.channels.fetch(c.discord).catch(() => null);
     if (!ch || !ch.isVoiceBased()) throw new Error(`Discord channel ${c.discord} not found or not a voice channel`);
-    log('DC', `Bridge: TS "${c.ts}" <-> Discord "${ch.name}"`);
+    log('DC', `Bridge: TS "${c.ts}"${servers.size > 1 ? ` on ${c.server}` : ''} <-> Discord "${ch.name}"`);
   }
-
-  if (relayChat) manager.client.on(Events.MessageCreate, onDiscordMessage);
 
   manager.client.on(Events.VoiceStateUpdate, (oldS, newS) => {
     if (newS.member?.user.bot) return;
@@ -494,15 +621,15 @@ async function main() {
     scheduleReconcile();
   });
 
-  ts.start();
+  for (const name of servers.keys()) startServer(name);
   scheduleReconcile();
-  log('DC', `Bridge running with ${bots.length} bots`);
+  log('DC', `Bridge running with ${bots.length} bots and ${servers.size} TeamSpeak server(s)`);
 }
 
 function shutdown() {
   log('DC', 'Shutting down bridge');
   for (const b of bots) disconnectBot(b);
-  ts.stop();
+  for (const srv of servers.values()) srv.proc?.stop();
   setTimeout(() => process.exit(0), 1500);
 }
 process.on('SIGINT', shutdown);
@@ -511,6 +638,6 @@ process.on('unhandledRejection', (e) => log('DC', `Unhandled: ${e?.stack || e}`)
 
 main().catch((e) => {
   log('DC', `Startup failed: ${e.message}`);
-  ts.stop();
+  for (const srv of servers.values()) srv.proc?.stop();
   process.exit(1);
 });

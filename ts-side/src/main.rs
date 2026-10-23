@@ -23,7 +23,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 use tsclientlib::prelude::*;
-use tsclientlib::{ChannelId, Connection, DisconnectOptions, Identity, InMessage, StreamItem, TextMessageTargetMode};
+use tsclientlib::events::Event as BookEvent;
+use tsclientlib::{ChannelId, Connection, DisconnectOptions, Identity, MessageTarget, StreamItem};
 use tsproto_packets::packets::{AudioData, CodecType, OutAudio};
 
 const FRAME_JSON: u8 = 1;
@@ -79,6 +80,8 @@ enum Command {
 	Chat { channel: usize, key: Option<String>, name: String, text: String },
 	/// Discord DM reply -> TS private message from the user's TS client.
 	Private { key: String, to: u16, text: String },
+	/// Private message sent by the listener, for Discord users without an own TS client.
+	ListenerPrivate { channel: usize, to: u16, text: String },
 }
 
 #[derive(Serialize)]
@@ -89,9 +92,11 @@ enum Event<'a> {
 	/// Status of a Discord user's TS client.
 	User { key: &'a str, status: &'a str, detail: Option<String> },
 	/// TS channel chat message.
-	Chat { index: usize, from: &'a str, text: &'a str },
+	Chat { index: usize, from_id: u16, from: &'a str, text: &'a str },
 	/// Something private for a Discord user: kind is "message", "poke" or "whisper".
 	Private { key: &'a str, kind: &'a str, from_id: u16, from_name: &'a str, text: &'a str },
+	/// Private message or poke to a listener (a reply to a message the listener relayed).
+	ListenerPrivate { index: usize, kind: &'a str, from_id: u16, from_name: &'a str, text: &'a str },
 }
 
 #[derive(Serialize)]
@@ -111,6 +116,7 @@ enum UserCmd {
 
 enum ListenerCmd {
 	Chat(String),
+	Private { to: u16, text: String },
 }
 
 /// TeamSpeak text messages are limited to 1024 characters.
@@ -236,6 +242,11 @@ async fn main() -> Result<()> {
 						let _ = tx.send(UserCmd::Chat(text));
 					} else if let Some(tx) = listener_tx.get(channel) {
 						let _ = tx.send(ListenerCmd::Chat(format!("[b]{}:[/b] {}", name, text)));
+					}
+				}
+				Ok(Command::ListenerPrivate { channel, to, text }) => {
+					if let Some(tx) = listener_tx.get(channel) {
+						let _ = tx.send(ListenerCmd::Private { to, text });
 					}
 				}
 				Ok(Command::Private { key, to, text }) => {
@@ -512,13 +523,22 @@ async fn listener_loop(
 				continue;
 			}
 			cmd = chat.recv() => {
-				if let Some(ListenerCmd::Chat(text)) = cmd {
+				if let Some(ListenerCmd::Private { to, text }) = cmd {
+					if con.get_state()?.clients.contains_key(&tsclientlib::ClientId(to)) {
+						for part in split_text(&text) {
+							let packet = con.get_state()?.send_message(MessageTarget::Client(tsclientlib::ClientId(to)), &part);
+							let _ = packet.send(con);
+						}
+					} else {
+						debug!(index, to, "Private message target is gone");
+					}
+				} else if let Some(ListenerCmd::Chat(text)) = cmd {
 					let in_target = con.get_state().ok()
 						.and_then(|s| s.clients.get(&s.own_client).map(|me| me.channel == target))
 						.unwrap_or(false);
 					if in_target {
 						for part in split_text(&text) {
-							let packet = con.get_state()?.send_message(tsclientlib::MessageTarget::Channel, &part);
+							let packet = con.get_state()?.send_message(MessageTarget::Channel, &part);
 							let _ = packet.send(con);
 						}
 					} else {
@@ -531,7 +551,26 @@ async fn listener_loop(
 		match item {
 			None => bail!("Connection closed"),
 			Some(Err(e)) => return Err(e.into()),
-			Some(Ok(StreamItem::BookEvents(_))) => report_channel(out, index, con, own, target),
+			Some(Ok(StreamItem::BookEvents(events))) => {
+				// Text messages arrive as book events, not as MessageEvent.
+				let own_client = con.get_state().ok().map(|s| s.own_client);
+				for ev in &events {
+					let BookEvent::Message { target, invoker, message } = ev else { continue };
+					// Messages written on Discord come back from our own clients, skip them.
+					if Some(invoker.id) == own_client || is_own_uid(own, invoker.uid.as_ref()) {
+						continue;
+					}
+					match target {
+						MessageTarget::Channel => out.event(&Event::Chat { index, from_id: invoker.id.0, from: &invoker.name, text: message }),
+						MessageTarget::Client(_) | MessageTarget::Poke(_) => {
+							let kind = if matches!(target, MessageTarget::Poke(_)) { "poke" } else { "message" };
+							out.event(&Event::ListenerPrivate { index, kind, from_id: invoker.id.0, from_name: &invoker.name, text: message });
+						}
+						_ => {}
+					}
+				}
+				report_channel(out, index, con, own, target);
+			}
 			Some(Ok(StreamItem::DisconnectedTemporarily(reason))) => {
 				warn!(index, ?reason, "Temporarily disconnected, reconnecting");
 				out.event(&Event::Channel { index, connected: false, name: "", clients: vec![] });
@@ -566,19 +605,6 @@ async fn listener_loop(
 					buf.extend_from_slice(&from.to_be_bytes());
 					buf.extend_from_slice(data);
 					out.frame(FRAME_AUDIO, &buf);
-				}
-			}
-			Some(Ok(StreamItem::MessageEvent(InMessage::TextMessage(msg)))) => {
-				let own_client = con.get_state().ok().map(|s| s.own_client);
-				for m in msg.iter() {
-					if !matches!(m.target, TextMessageTargetMode::Channel) || Some(m.invoker_id) == own_client {
-						continue;
-					}
-					// Messages written on Discord come back from our own clients, skip them.
-					if is_own_uid(own, m.invoker_uid.as_ref()) {
-						continue;
-					}
-					out.event(&Event::Chat { index, from: &m.invoker_name, text: &m.message });
 				}
 			}
 			Some(Ok(other)) => debug!(index, ?other, "Event"),
@@ -633,7 +659,7 @@ async fn user_task(
 					}
 					Some(UserCmd::Chat(text)) => {
 						for part in split_text(&text) {
-							let packet = con.get_state()?.send_message(tsclientlib::MessageTarget::Channel, &part);
+							let packet = con.get_state()?.send_message(MessageTarget::Channel, &part);
 							let _ = packet.send(&mut con);
 						}
 					}
@@ -644,7 +670,7 @@ async fn user_task(
 							continue;
 						}
 						for part in split_text(&text) {
-							let packet = con.get_state()?.send_message(tsclientlib::MessageTarget::Client(tsclientlib::ClientId(to)), &part);
+							let packet = con.get_state()?.send_message(MessageTarget::Client(tsclientlib::ClientId(to)), &part);
 							let _ = packet.send(&mut con);
 						}
 					}
@@ -653,19 +679,20 @@ async fn user_task(
 				item = next_event => match item {
 					None => bail!("Connection closed"),
 					Some(Err(e)) => return Err(e.into()),
-					Some(Ok(StreamItem::MessageEvent(InMessage::TextMessage(msg)))) => {
+					Some(Ok(StreamItem::BookEvents(events))) => {
+						// Private messages and pokes arrive as book events.
 						let own_client = con.get_state().ok().map(|s| s.own_client);
-						for m in msg.iter() {
-							if matches!(m.target, TextMessageTargetMode::Client) && Some(m.invoker_id) != own_client
-								&& !is_own_uid(&own, m.invoker_uid.as_ref())
-							{
-								out.event(&Event::Private { key: &key, kind: "message", from_id: m.invoker_id.0, from_name: &m.invoker_name, text: &m.message });
+						for ev in &events {
+							let BookEvent::Message { target, invoker, message } = ev else { continue };
+							if Some(invoker.id) == own_client || is_own_uid(&own, invoker.uid.as_ref()) {
+								continue;
 							}
-						}
-					}
-					Some(Ok(StreamItem::MessageEvent(InMessage::ClientPoke(msg)))) => {
-						for m in msg.iter() {
-							out.event(&Event::Private { key: &key, kind: "poke", from_id: m.invoker_id.0, from_name: &m.invoker_name, text: &m.message });
+							let kind = match target {
+								MessageTarget::Client(_) => "message",
+								MessageTarget::Poke(_) => "poke",
+								_ => continue,
+							};
+							out.event(&Event::Private { key: &key, kind, from_id: invoker.id.0, from_name: &invoker.name, text: message });
 						}
 					}
 					Some(Ok(StreamItem::Audio(packet))) => {

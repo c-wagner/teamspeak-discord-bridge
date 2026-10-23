@@ -1,11 +1,19 @@
 {
-  "ts": {
-    "address": "ts.example.com",
-    "serverPassword": "",
-    "listenerName": "Discord Bridge",
-    "idleChannel": "AFK",
-    "identityDir": "identities"
-  },
+  "servers": [
+    {
+      "name": "main",
+      "address": "ts.example.com",
+      "serverPassword": "",
+      "listenerName": "Discord Bridge",
+      "idleChannel": "AFK"
+    },
+    {
+      "name": "friends",
+      "address": "ts.friends.example",
+      "serverPassword": "",
+      "listenerName": "Discord Bridge"
+    }
+  ],
   "discord": {
     "guildId": "YOUR_DISCORD_SERVER_ID",
     "tokens": [
@@ -18,7 +26,8 @@
       "TOKEN_BOT_7",
       "TOKEN_BOT_8",
       "TOKEN_BOT_9",
-      "TOKEN_BOT_10"
+      "TOKEN_BOT_10",
+      "TOKEN_BOT_11"
     ],
     "language": "en",
     "relayChat": true,
@@ -27,14 +36,22 @@
   },
   "channels": [
     {
+      "server": "main",
       "ts": "Lobby",
       "tsPassword": "",
       "discord": "DISCORD_VOICE_CHANNEL_ID_1"
     },
     {
+      "server": "main",
       "ts": "Gaming/Room 1",
       "tsPassword": "",
       "discord": "DISCORD_VOICE_CHANNEL_ID_2"
+    },
+    {
+      "server": "friends",
+      "ts": "Hangout",
+      "tsPassword": "",
+      "discord": "DISCORD_VOICE_CHANNEL_ID_3"
     }
   ]
 }

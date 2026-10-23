@@ -20,15 +20,19 @@ function clip(text, max = 1900) {
 }
 
 const name = (n) => `**${escapeMarkdown(n || '?')}**`;
+const withHint = (text, hint) => (hint ? `${text}\n-# ${hint}` : text);
 
 const STRINGS = {
   en: {
     channelChat: (from, text) => `${name(from)} (TS): ${text}`,
-    privateMessage: (from, text) =>
-      `💬 ${name(from)} sent you a private message on TeamSpeak:\n${text}\n-# Reply here and your answer goes privately to ${escapeMarkdown(from)}.`,
-    poke: (from, text) => `👉 ${name(from)} poked you on TeamSpeak${text ? `: ${text}` : ''}\n-# Reply here to answer privately.`,
-    whisper: (from) => `🤫 ${name(from)} is whispering to you on TeamSpeak. Whispers are voice only and cannot be heard on Discord.\n-# Reply here to answer privately.`,
-    noReplyTarget: 'Nobody has messaged you privately on TeamSpeak yet, so I do not know who to send this to.',
+    privateMessage: (from, text, hint) => withHint(`💬 ${name(from)}: ${text}`, hint),
+    poke: (from, text, hint) => withHint(`👉 ${name(from)} poked you${text ? `: ${text}` : ''}`, hint),
+    whisper: (from, hint) =>
+      withHint(`🤫 ${name(from)} is whispering to you on TeamSpeak. Whispers are voice only and cannot be heard on Discord.`, hint),
+    replyHint: (from) => `Reply here and your answer goes privately to ${escapeMarkdown(from)} on TeamSpeak.`,
+    noReplyTarget:
+      'Nobody has messaged you privately on TeamSpeak yet. To write to someone, send a DM to the bot that carries their name.',
+    botIdle: 'This bot does not represent anyone on TeamSpeak right now.',
     not_connected: 'You are not connected to TeamSpeak right now. Join a bridged voice channel first.',
     target_gone: 'That person is no longer on the TeamSpeak server.',
     placeholderEmpty: 'empty',
@@ -36,11 +40,14 @@ const STRINGS = {
   },
   de: {
     channelChat: (from, text) => `${name(from)} (TS): ${text}`,
-    privateMessage: (from, text) =>
-      `💬 ${name(from)} schreibt dir privat auf TeamSpeak:\n${text}\n-# Antworte hier, dann geht deine Nachricht privat an ${escapeMarkdown(from)}.`,
-    poke: (from, text) => `👉 ${name(from)} hat dich auf TeamSpeak angestupst${text ? `: ${text}` : ''}\n-# Antworte hier, um privat zu antworten.`,
-    whisper: (from) => `🤫 ${name(from)} flüstert dir auf TeamSpeak zu. Flüstern ist nur Sprache und kommt in Discord nicht an.\n-# Antworte hier, um privat zu antworten.`,
-    noReplyTarget: 'Dir hat auf TeamSpeak noch niemand privat geschrieben, ich weiß also nicht, an wen das gehen soll.',
+    privateMessage: (from, text, hint) => withHint(`💬 ${name(from)}: ${text}`, hint),
+    poke: (from, text, hint) => withHint(`👉 ${name(from)} hat dich angestupst${text ? `: ${text}` : ''}`, hint),
+    whisper: (from, hint) =>
+      withHint(`🤫 ${name(from)} flüstert dir auf TeamSpeak zu. Flüstern ist nur Sprache und kommt in Discord nicht an.`, hint),
+    replyHint: (from) => `Antworte hier, dann geht deine Nachricht privat an ${escapeMarkdown(from)} auf TeamSpeak.`,
+    noReplyTarget:
+      'Dir hat auf TeamSpeak noch niemand privat geschrieben. Um jemandem zu schreiben, schick dem Bot mit seinem Namen eine DM.',
+    botIdle: 'Dieser Bot stellt gerade niemanden auf TeamSpeak dar.',
     not_connected: 'Du bist gerade nicht mit TeamSpeak verbunden. Geh zuerst in einen Bridge Voice Channel.',
     target_gone: 'Die Person ist nicht mehr auf dem TeamSpeak Server.',
     placeholderEmpty: 'leer',
