@@ -1,0 +1,40 @@
+{
+  "ts": {
+    "address": "ts.example.com",
+    "serverPassword": "",
+    "listenerName": "Discord Bridge",
+    "idleChannel": "AFK",
+    "identityDir": "identities"
+  },
+  "discord": {
+    "guildId": "YOUR_DISCORD_SERVER_ID",
+    "tokens": [
+      "TOKEN_BOT_1",
+      "TOKEN_BOT_2",
+      "TOKEN_BOT_3",
+      "TOKEN_BOT_4",
+      "TOKEN_BOT_5",
+      "TOKEN_BOT_6",
+      "TOKEN_BOT_7",
+      "TOKEN_BOT_8",
+      "TOKEN_BOT_9",
+      "TOKEN_BOT_10"
+    ],
+    "language": "en",
+    "relayChat": true,
+    "dcNameSuffix": " (DC)",
+    "placeholderName": "TeamSpeak"
+  },
+  "channels": [
+    {
+      "ts": "Lobby",
+      "tsPassword": "",
+      "discord": "DISCORD_VOICE_CHANNEL_ID_1"
+    },
+    {
+      "ts": "Gaming/Room 1",
+      "tsPassword": "",
+      "discord": "DISCORD_VOICE_CHANNEL_ID_2"
+    }
+  ]
+}

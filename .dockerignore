@@ -1,0 +1,6 @@
+.git/
+.github/
+data/
+**/node_modules/
+ts-side/target/
+*.md

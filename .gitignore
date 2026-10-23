@@ -1,0 +1,15 @@
+# Secrets and runtime state
+data/config.json
+data/identities/
+identities/
+config.json
+
+# Build output
+discord-side/node_modules/
+ts-side/target/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

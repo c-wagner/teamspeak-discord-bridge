@@ -1,0 +1,22 @@
+[package]
+name = "ts-bridge"
+description = "TeamSpeak side of the TeamSpeak <-> Discord bridge"
+license = "MIT"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "io-std", "macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tsclientlib = { git = "https://github.com/ReSpeak/tsclientlib", rev = "ee3bc6f45a7137db7793ba5593a321df400d53e5" }
+tsproto-packets = { git = "https://github.com/ReSpeak/tsclientlib", rev = "ee3bc6f45a7137db7793ba5593a321df400d53e5" }
+tsproto = { git = "https://github.com/ReSpeak/tsclientlib", rev = "ee3bc6f45a7137db7793ba5593a321df400d53e5" }
+
+[profile.release]
+opt-level = 3

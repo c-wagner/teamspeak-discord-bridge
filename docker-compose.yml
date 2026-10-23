@@ -1,0 +1,15 @@
+services:
+  bridge:
+    build: .
+    image: ts-discord-bridge
+    container_name: ts-discord-bridge
+    restart: unless-stopped
+    # environment:
+    #   - RUST_LOG=debug,tsproto=warn   # verbose TeamSpeak log for troubleshooting
+    volumes:
+      - ./data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

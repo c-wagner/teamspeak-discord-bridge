@@ -1,0 +1,17 @@
+# systemd unit for running without Docker.
+# Install: sed "s/BRIDGE_USER/$USER/g" ts-discord-bridge.service | sudo tee /etc/systemd/system/ts-discord-bridge.service
+[Unit]
+Description=TeamSpeak <-> Discord Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=BRIDGE_USER
+WorkingDirectory=/home/BRIDGE_USER/ts-discord-bridge/discord-side
+ExecStart=/usr/bin/node index.js ../data/config.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

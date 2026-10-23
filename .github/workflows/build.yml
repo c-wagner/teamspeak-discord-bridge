@@ -1,0 +1,37 @@
+name: build
+ 
+on:
+  push:
+  pull_request:
+ 
+jobs:
+  ts-side:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ts-side
+      - run: sudo apt-get update && sudo apt-get install -y cmake pkg-config libssl-dev
+      - run: cargo build --release --locked
+        working-directory: ts-side
+ 
+  discord-side:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: discord-side
+      - run: for f in *.js; do node --check "$f"; done
+        working-directory: discord-side
+ 
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t ts-discord-bridge .
+ 

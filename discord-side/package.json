@@ -1,0 +1,19 @@
+{
+  "name": "ts-discord-bridge",
+  "version": "1.0.0",
+  "description": "TeamSpeak 3 <-> Discord voice and text bridge",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js ../data/config.json"
+  },
+  "dependencies": {
+    "@discordjs/voice": "0.19.2",
+    "@snazzah/davey": "0.1.12",
+    "discord.js": "14.27.0"
+  },
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}
